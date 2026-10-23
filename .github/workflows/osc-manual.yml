@@ -1,0 +1,117 @@
+name: OSS Manual CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Fork branch or ref to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout candidate ref
+        uses: actions/checkout@v4
+        with:
+          repository: Nitjsefnie-OSC/cedar-java
+          ref: ${{ inputs.target_ref }}
+
+      - name: Report checked-out SHA
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+
+      - name: Checkout cedar-policy
+        uses: actions/checkout@v4
+        with:
+          repository: cedar-policy/cedar
+          ref: refs/heads/main
+          path: ./cedar
+
+      - name: Prepare Rust Build
+        run: rustup install stable && rustup default stable && rustup component add rustfmt
+
+      - name: Configure CedarJavaFFI for CI build
+        run: bash configure_ci_build.sh
+
+      - name: Check FFI Formatting
+        working-directory: CedarJavaFFI
+        run: cargo fmt --all --check
+
+      - name: Run FFI tests
+        working-directory: CedarJavaFFI
+        run: cargo test --all-features
+
+      - name: Install Zig
+        run: wget https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz -O - | tar xJ && echo "$(pwd)/zig-linux-x86_64-0.11.0" >> $GITHUB_PATH
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'corretto'
+          cache: 'gradle'
+
+      - name: Build FFI and Java Libraries
+        working-directory: CedarJava
+        run: ./gradlew build
+
+      - name: Generate Java Documentation
+        working-directory: CedarJava
+        run: ./gradlew javadoc
+
+      - name: Build uber JAR and runtime dependencies for Alpine smoke
+        id: smokebuild
+        working-directory: CedarJava
+        run: ./gradlew uberJar copyRuntimeDependencies
+
+      - name: Run the uber JAR on musl
+        if: steps.smokebuild.outcome == 'success'
+        working-directory: CedarJava
+        run: |
+          cat > build/Smoke.java <<'JAVA'
+          import com.cedarpolicy.BasicAuthorizationEngine;
+          import com.cedarpolicy.model.AuthorizationRequest;
+          import com.cedarpolicy.model.AuthorizationResponse.SuccessOrFailure;
+          import com.cedarpolicy.model.entity.Entity;
+          import com.cedarpolicy.model.policy.Policy;
+          import com.cedarpolicy.model.policy.PolicySet;
+          import com.cedarpolicy.value.EntityTypeName;
+          import com.cedarpolicy.value.EntityUID;
+          import java.util.Map;
+          import java.util.Set;
+
+          class Smoke {
+              public static void main(String[] args) throws Exception {
+                  var engine = new BasicAuthorizationEngine();
+                  var request = new AuthorizationRequest(
+                          new EntityUID(EntityTypeName.parse("User").orElseThrow(), "alice"),
+                          new EntityUID(EntityTypeName.parse("Action").orElseThrow(), "view"),
+                          new EntityUID(EntityTypeName.parse("Resource").orElseThrow(), "doc"),
+                          Map.of());
+                  for (boolean expected : new boolean[] {true, false}) {
+                      String effect = expected ? "permit" : "forbid";
+                      var policies = new PolicySet(Set.of(
+                              new Policy(effect + "(principal, action, resource);", "policy0")));
+                      var response = engine.isAuthorized(request, policies, Set.<Entity>of());
+                      if (response.type != SuccessOrFailure.Success
+                              || response.success.orElseThrow().isAllowed() != expected) {
+                          throw new AssertionError("Unexpected " + effect + " response: " + response);
+                      }
+                      System.out.println(effect + ": allowed=" + expected);
+                  }
+              }
+          }
+          JAVA
+          docker run --rm \
+            -v "$PWD/build/libs:/smoke/libs:ro" \
+            -v "$PWD/build/dependencies:/smoke/dependencies:ro" \
+            -v "$PWD/build/Smoke.java:/smoke/Smoke.java:ro" \
+            -w /smoke \
+            eclipse-temurin:17-alpine \
+            sh -ec 'unset CEDAR_JAVA_FFI_LIB; java -cp "libs/*:dependencies/*" Smoke.java'
